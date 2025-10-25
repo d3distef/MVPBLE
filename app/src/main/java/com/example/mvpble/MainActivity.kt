@@ -42,7 +42,10 @@ class MainActivity : ComponentActivity() {
     private val UUID_SPRINT  = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0f6") // READ|NOTIFY (uint32 ms)
     private val CCCD_UUID    = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb") // 0x2902
 
-    private val TARGET_NAME = "SprintBeacon"
+    //private val TARGET_NAME = "SprintBeacon"
+
+    // New name is "SprintFinish-XX", but we’ll primarily filter by service UUID.
+    private val NAME_PREFIX = "Sprint"
 
     // ======= BLE plumbing =======
     private lateinit var bluetoothAdapter: BluetoothAdapter
@@ -57,7 +60,7 @@ class MainActivity : ComponentActivity() {
     private var chSprint:  BluetoothGattCharacteristic? = null
 
     private var lastFoundMac: String? = null
-
+    private var lastFoundName: String? = null
     // ---- Notification write queue (one CCCD write at a time)
     private val notifyQueue: ArrayDeque<BluetoothGattCharacteristic> = ArrayDeque()
 
@@ -156,7 +159,7 @@ class MainActivity : ComponentActivity() {
 
             // Row 2: connection
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onConnect, enabled = !connected) { Text("Connect") }
+                Button(onClick = onConnect, enabled = !connected) { Text("Connect" + (lastFoundName?.let { " ($it)" } ?: "")) }
                 Button(onClick = onDisconnect, enabled = connected) { Text("Disconnect") }
             }
             Spacer(Modifier.height(8.dp))
@@ -211,7 +214,6 @@ class MainActivity : ComponentActivity() {
 
         val filters = listOf(
             ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build(),
-            ScanFilter.Builder().setDeviceName(TARGET_NAME).build()
         )
         val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
 
@@ -241,9 +243,17 @@ class MainActivity : ComponentActivity() {
             val addr = result.device.address
             val rssi = result.rssi
             log("Found: $name | $addr | RSSI=$rssi")
-            if (name == TARGET_NAME) {
+            // Extra: accept if name starts with "Sprint" OR service UUID matched (filter already did).
+            if (name.startsWith(NAME_PREFIX, ignoreCase = true)) {
                 lastFoundMac = addr
-                log("✅ SprintBeacon spotted → stopping scan.")
+                lastFoundName = name
+                log("✅ Found: $name  | $addr  | RSSI=$rssi → stopping scan.")
+                stopScan()
+            } else {
+                // Still show anything with SERVICE_UUID (the filter ensures this)
+                lastFoundMac = addr
+                lastFoundName = name
+                log("Found (UUID match): $name | $addr | RSSI=$rssi")
                 stopScan()
             }
         }
