@@ -16,56 +16,77 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.ArrayDeque
 import java.util.UUID
+import kotlin.math.max
 
 class MainActivity : ComponentActivity() {
 
-    // ======= Your service & characteristic UUIDs =======
+    // ===== BLE UUIDs (ESP32) =====
     private val SERVICE_UUID = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0a1")
     private val UUID_STATUS  = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0b2") // READ|NOTIFY (JSON)
-    private val UUID_CONTROL = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0c3") // WRITE (JSON cmds)
     private val UUID_RANGE   = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0d4") // READ|NOTIFY (uint16 cm)
     private val UUID_SPRINT  = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0f6") // READ|NOTIFY (uint32 ms)
-    private val CCCD_UUID    = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb") // 0x2902
+    private val CCCD_UUID    = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-    //private val TARGET_NAME = "SprintBeacon"
-
-    // New name is "SprintFinish-XX", but we’ll primarily filter by service UUID.
-    private val NAME_PREFIX = "Sprint"
-
-    // ======= BLE plumbing =======
+    // ===== BLE plumbing =====
     private lateinit var bluetoothAdapter: BluetoothAdapter
     private var bleScanner: BluetoothLeScanner? = null
     private val handler = Handler(Looper.getMainLooper())
-    private var scanning = false
 
+    private var scanning = false
     private var gatt: BluetoothGatt? = null
-    private var chControl: BluetoothGattCharacteristic? = null
     private var chStatus:  BluetoothGattCharacteristic? = null
     private var chRange:   BluetoothGattCharacteristic? = null
     private var chSprint:  BluetoothGattCharacteristic? = null
+    private val notifyQueue: ArrayDeque<BluetoothGattCharacteristic> = ArrayDeque()
 
     private var lastFoundMac: String? = null
     private var lastFoundName: String? = null
-    // ---- Notification write queue (one CCCD write at a time)
-    private val notifyQueue: ArrayDeque<BluetoothGattCharacteristic> = ArrayDeque()
 
-    // ---- Lightweight polling (fallback) ----
-    private val pollIntervalMs = 1000L
+    // ===== App/UI state =====
+    private val _connected = mutableStateOf(false)
+    private val _scanning  = mutableStateOf(false)
+    private val _found     = mutableStateOf(false)
+
+    private val _lidarCm   = mutableStateOf<Int?>(null)     // from RANGE or STATUS.lidar_cm
+
+    // Live timer (big center) — independent
+    private var startMonotonicMs: Long? = null
+    private val _liveElapsedMs = mutableStateOf(0L)
+    private val _isRunActive   = mutableStateOf(false)
+
+    // Device sprint result & frozen MPH (shown in "Results")
+    private val _finalSprintMsFromDevice = mutableStateOf<Long?>(null)
+    private val _frozenMph = mutableStateOf<Double?>(null)
+
+    // Range locking logic
+    private val rangeLocked = mutableStateOf(false)
+    private var lockedRangeYardsSnapshot: Double? = null
+
+    // Sprint buffering with run tagging
+    private var runId: Int = 0
+    private var pendingSprintMs: Long? = null
+    private var pendingSprintRunId: Int = -1
+
+    // Track previous have_start to detect edges
+    private var haveStartPrev = false
+
+    // Lightweight polling
+    private val pollIntervalMs = 800L
     private val pollRunnable = object : Runnable {
         override fun run() {
             val g = gatt
@@ -78,20 +99,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ======= Compose state to show in UI =======
-    private var scanLogger: ((String) -> Unit)? = null
-    private fun log(msg: String) { scanLogger?.invoke(msg) }
-
-    // Data from device
-    private val _connected = mutableStateOf(false)
-    private val _rangeCm   = mutableStateOf<Int?>(null)
-    private val _haveStart = mutableStateOf(false)
-    private val _sprintMs  = mutableStateOf<Long?>(null)
-    private val _laserOn   = mutableStateOf<Boolean?>(null)
-    private val _autoMode  = mutableStateOf<Boolean?>(null)
-    private val _uptimeMs  = mutableStateOf<Long?>(null)
-
-    // ======= Activity results =======
+    // ===== Activity results =====
     private val enableBtLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { _: ActivityResult -> tryStartScan() }
@@ -107,189 +115,278 @@ class MainActivity : ComponentActivity() {
         bluetoothAdapter = bm.adapter
 
         setContent {
-            MaterialTheme {
-                Surface(Modifier.fillMaxSize()) {
-                    ScannerAndControlScreen(
-                        connected = _connected.value,
-                        rangeCm = _rangeCm.value,
-                        haveStart = _haveStart.value,
-                        sprintMs = _sprintMs.value,
-                        laserOn = _laserOn.value,
-                        autoMode = _autoMode.value,
-                        uptimeMs = _uptimeMs.value,
-                        onScan = { tryStartScan() },
-                        onStopScan = { stopScan() },
+            MaterialTheme(colorScheme = darkColorScheme()) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .windowInsetsPadding(WindowInsets.safeDrawing)
+                ) {
+                    val connected by _connected
+                    val scanningState by _scanning
+                    val found by _found
+
+                    val lidarCm by _lidarCm
+                    val lidarYards = remember(lidarCm) { lidarCm?.let { it / 91.44 } }
+
+                    val isRunActive by _isRunActive
+                    val liveTimerMs by _liveElapsedMs
+                    val finalDeviceSprintMs by _finalSprintMsFromDevice
+                    val frozenMph by _frozenMph
+
+                    // Range controls (textbox is user-facing truth when not using LiDAR)
+                    var useLidar by remember { mutableStateOf(true) }
+                    var calcText by remember { mutableStateOf("") }
+                    var calcYards by remember { mutableStateOf<Double?>(null) }
+
+                    // Keep textbox mirrored to LiDAR while unlocked & using LiDAR
+                    LaunchedEffect(lidarYards, useLidar, rangeLocked.value) {
+                        if (!rangeLocked.value && useLidar) {
+                            calcYards = lidarYards
+                            calcText = lidarYards?.let { String.format("%.2f", it) } ?: ""
+                        }
+                    }
+
+                    // Tick big timer only when a run is active
+                    LaunchedEffect(isRunActive) {
+                        if (isRunActive) {
+                            while (_isRunActive.value) {
+                                startMonotonicMs?.let { t0 ->
+                                    _liveElapsedMs.value = max(0, System.currentTimeMillis() - t0)
+                                }
+                                kotlinx.coroutines.delay(16L)
+                            }
+                        }
+                    }
+
+                    MainScreen(
+                        scanning = scanningState,
+                        connected = connected,
+                        found = found,
+                        foundName = lastFoundName,
+                        onScan = { onScanClicked() },
                         onConnect = { connectToLastFound() },
-                        onDisconnect = { disconnectGatt() },
-                        onLaser = { on -> writeControlJson(if (on) """{"laser":true}""" else """{"laser":false}""") },
-                        onAuto  = { auto -> writeControlJson(if (auto) """{"auto":true}""" else """{"auto":false}""") }
+
+                        lidarYards = lidarYards,
+
+                        useLidar = useLidar,
+                        onUseLidarToggle = { checked ->
+                            if (!rangeLocked.value) {
+                                useLidar = checked
+                                if (checked) {
+                                    calcYards = lidarYards
+                                    calcText = lidarYards?.let { String.format("%.2f", it) } ?: ""
+                                }
+                            }
+                        },
+
+                        calcText = calcText,
+                        onCalcTextChange = { txt ->
+                            if (!rangeLocked.value && !useLidar) {
+                                val clean = txt.filter { it.isDigit() || it == '.' }
+                                calcText = clean
+                                calcYards = clean.toDoubleOrNull()
+                            }
+                        },
+
+                        rangeLocked = rangeLocked.value,
+
+                        // Big timer is purely live
+                        liveTimerMs = liveTimerMs,
+
+                        // Results show ONLY the final device time & frozen MPH (after finish)
+                        finalDeviceSprintMs = finalDeviceSprintMs,
+                        frozenMph = frozenMph
                     )
+
+                    // Range snapshot provider for locking at START
+                    currentCalcRangeYardsProvider = {
+                        if (useLidar) (lidarYards ?: calcYards) else calcYards
+                    }
                 }
             }
         }
     }
 
-    // ================= UI =================
+    // Provider set in composition to read the current calc range when locking
+    private var currentCalcRangeYardsProvider: (() -> Double?)? = null
+
+    // ================= UI host =================
     @Composable
-    private fun ScannerAndControlScreen(
+    private fun MainScreen(
+        scanning: Boolean,
         connected: Boolean,
-        rangeCm: Int?,
-        haveStart: Boolean,
-        sprintMs: Long?,
-        laserOn: Boolean?,
-        autoMode: Boolean?,
-        uptimeMs: Long?,
+        found: Boolean,
+        foundName: String?,
         onScan: () -> Unit,
-        onStopScan: () -> Unit,
         onConnect: () -> Unit,
-        onDisconnect: () -> Unit,
-        onLaser: (Boolean) -> Unit,
-        onAuto: (Boolean) -> Unit
+
+        lidarYards: Double?,
+
+        useLidar: Boolean,
+        onUseLidarToggle: (Boolean) -> Unit,
+
+        calcText: String,
+        onCalcTextChange: (String) -> Unit,
+
+        rangeLocked: Boolean,
+
+        liveTimerMs: Long,
+        finalDeviceSprintMs: Long?,
+        frozenMph: Double?
     ) {
-        var log by remember { mutableStateOf("") }
-        scanLogger = { msg -> log += (if (log.isEmpty()) "" else "\n") + msg }
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            // Top row: Scan / Connect
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Button(
+                    modifier = Modifier.weight(1f),
+                    onClick = onScan,
+                    enabled = !scanning && !connected
+                ) { Text(if (scanning) "Scanning…" else "Scan") }
 
-        Column(Modifier.fillMaxSize().padding(16.dp)) {
-            // Row 1: scanning
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onScan, modifier = Modifier.weight(1f)) { Text("Scan for SprintBeacon") }
-                Button(onClick = onStopScan, modifier = Modifier.weight(1f)) { Text("Stop") }
-            }
-            Spacer(Modifier.height(8.dp))
+                val connectLabel = when {
+                    connected -> "Connected"
+                    found && foundName != null -> "Connect to $foundName"
+                    found -> "Connect to device"
+                    else -> "Connect"
+                }
 
-            // Row 2: connection
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onConnect, enabled = !connected) { Text("Connect" + (lastFoundName?.let { " ($it)" } ?: "")) }
-                Button(onClick = onDisconnect, enabled = connected) { Text("Disconnect") }
+                Button(
+                    modifier = Modifier.weight(1f),
+                    onClick = onConnect,
+                    enabled = !connected && found
+                ) { Text(connectLabel) }
             }
-            Spacer(Modifier.height(8.dp))
 
-            // Row 3: controls
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { onLaser(true) }, enabled = connected) { Text("Laser ON") }
-                Button(onClick = { onLaser(false) }, enabled = connected) { Text("Laser OFF") }
-            }
-            Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { onAuto(true) }, enabled = connected) { Text("Auto Mode") }
-                Button(onClick = { onAuto(false) }, enabled = connected) { Text("Manual Mode") }
-            }
-            Spacer(Modifier.height(12.dp))
+            // Ranges block
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Ranges (yards)", style = MaterialTheme.typography.titleMedium)
+                    Text("LiDAR: ${lidarYards?.let { String.format("%.2f", it) } ?: "-"} yd")
 
-            // Live values
-            Text("Connected: $connected")
-            Text("Range: ${rangeCm ?: "-"} cm")
-            Text("Start seen: $haveStart")
-            Text("Sprint: ${sprintMs?.let { "${it} ms" } ?: "-"}")
-            Text("Laser: ${laserOn ?: "-"}")
-            Text("Auto: ${autoMode ?: "-"}")
-            Text("Uptime: ${uptimeMs?.let { formatHms(it) } ?: "-"}")
-            Spacer(Modifier.height(12.dp))
-            Text(
-                text = log.ifEmpty { "Logs will appear here…" },
-                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())
-            )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Checkbox(
+                            checked = useLidar,
+                            onCheckedChange = onUseLidarToggle,
+                            enabled = !rangeLocked
+                        )
+                        Text("Use LiDAR for calculations")
+                    }
+
+                    OutlinedTextField(
+                        value = calcText,
+                        onValueChange = onCalcTextChange,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Calc range (yards)") },
+                        enabled = !useLidar && !rangeLocked,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true
+                    )
+                }
+            }
+
+            // Big timer — LIVE ONLY
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentAlignment = Alignment.Center
+            ) {
+                val timeText = String.format("%.3f", liveTimerMs / 1000.0)
+                Text(text = timeText, fontSize = 64.sp, fontWeight = FontWeight.SemiBold)
+            }
+
+            // Results — ONLY final device time & frozen MPH (after finish)
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Results", style = MaterialTheme.typography.titleMedium)
+                    Text("Sprint time (s): ${finalDeviceSprintMs?.let { String.format("%.3f", it / 1000.0) } ?: "-"}")
+                    Text("Average MPH: ${frozenMph?.let { String.format("%.2f", it) } ?: "-"}")
+                }
+            }
         }
     }
 
-    // ================= Scanning (with MAC capture) =================
+    // ================= Scan → find device =================
+    private fun onScanClicked() {
+        _found.value = false
+        lastFoundMac = null
+        lastFoundName = null
+        tryStartScan()
+    }
+
     private fun tryStartScan() {
-        if (!hasAllNeededPermissions()) {
-            requestNeededPermissions()
-            return
-        }
+        if (!hasAllNeededPermissions()) { requestNeededPermissions(); return }
         if (!bluetoothAdapter.isEnabled) {
             val intent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
-            enableBtLauncher.launch(intent)
-            return
+            enableBtLauncher.launch(intent); return
         }
-        val scanner = bluetoothAdapter.bluetoothLeScanner ?: run {
-            log("BluetoothLeScanner is null.")
-            return
-        }
-        if (scanning) {
-            log("Already scanning…")
-            return
-        }
+        val scanner = bluetoothAdapter.bluetoothLeScanner ?: return
+        if (scanning) return
 
         val filters = listOf(
-            ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build(),
+            ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build()
         )
-        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
 
-        log("Starting BLE scan (10s)…")
         scanning = true
+        _scanning.value = true
         bleScanner = scanner
         scanner.startScan(filters, settings, scanCallback)
 
-        handler.postDelayed({
-            if (scanning) {
-                stopScan()
-                log("Scan stopped (timeout).")
-            }
-        }, 10_000)
+        handler.postDelayed({ if (scanning) stopScan() }, 10_000)
     }
 
     private fun stopScan() {
         if (scanning) {
             bleScanner?.stopScan(scanCallback)
             scanning = false
+            _scanning.value = false
         }
     }
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val name = result.device.name ?: "(no name)"
-            val addr = result.device.address
-            val rssi = result.rssi
-            log("Found: $name | $addr | RSSI=$rssi")
-            // Extra: accept if name starts with "Sprint" OR service UUID matched (filter already did).
-            if (name.startsWith(NAME_PREFIX, ignoreCase = true)) {
-                lastFoundMac = addr
-                lastFoundName = name
-                log("✅ Found: $name  | $addr  | RSSI=$rssi → stopping scan.")
-                stopScan()
-            } else {
-                // Still show anything with SERVICE_UUID (the filter ensures this)
-                lastFoundMac = addr
-                lastFoundName = name
-                log("Found (UUID match): $name | $addr | RSSI=$rssi")
-                stopScan()
-            }
+            lastFoundMac = result.device.address
+            lastFoundName = result.device.name ?: "SprintBeacon"
+            _found.value = true
+            stopScan()
         }
         override fun onBatchScanResults(results: MutableList<ScanResult>) {
-            results.forEach { onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, it) }
+            if (results.isNotEmpty()) onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, results.first())
         }
-        override fun onScanFailed(errorCode: Int) {
-            log("Scan failed: code=$errorCode")
-        }
+        override fun onScanFailed(errorCode: Int) { stopScan() }
     }
 
-    // ================= GATT connection & discovery =================
+    // ================= Connect & discover =================
     private fun connectToLastFound() {
-        val mac = lastFoundMac
-        if (mac == null) {
-            log("No MAC captured yet. Scan first.")
-            return
-        }
-        if (!hasAllNeededPermissions()) {
-            requestNeededPermissions(); return
-        }
+        val mac = lastFoundMac ?: return
+        if (!hasAllNeededPermissions()) { requestNeededPermissions(); return }
+        stopScan()
         val device = bluetoothAdapter.getRemoteDevice(mac)
-        log("Connecting to $mac …")
         gatt = device.connectGatt(this, false, gattCallback)
     }
 
     private fun disconnectGatt() {
         stopPolling()
-        gatt?.let {
-            log("Disconnecting…")
-            it.disconnect()
-            it.close()
-        }
+        gatt?.let { it.disconnect(); it.close() }
         gatt = null
         _connected.value = false
-        chControl = null; chStatus = null; chRange = null; chSprint = null
+        chStatus = null; chRange = null; chSprint = null
         notifyQueue.clear()
     }
 
@@ -297,43 +394,31 @@ class MainActivity : ComponentActivity() {
 
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                log("GATT connected. Requesting HIGH priority & MTU…")
                 _connected.value = true
                 gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                gatt.requestMtu(247) // after this we'll discover services
+                gatt.requestMtu(247)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                log("GATT disconnected (status=$status)")
                 _connected.value = false
                 stopPolling()
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            log("MTU changed to $mtu (status=$status). Discovering services…")
             gatt.discoverServices()
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                log("Service discovery failed: $status")
-                return
-            }
-            val svc = gatt.getService(SERVICE_UUID)
-            if (svc == null) {
-                log("Service not found.")
-                return
-            }
-            chControl = svc.getCharacteristic(UUID_CONTROL)
-            chStatus  = svc.getCharacteristic(UUID_STATUS)
-            chRange   = svc.getCharacteristic(UUID_RANGE)
-            chSprint  = svc.getCharacteristic(UUID_SPRINT)
+            if (status != BluetoothGatt.GATT_SUCCESS) return
+            val svc = gatt.getService(SERVICE_UUID) ?: return
+            chStatus = svc.getCharacteristic(UUID_STATUS)
+            chRange  = svc.getCharacteristic(UUID_RANGE)
+            chSprint = svc.getCharacteristic(UUID_SPRINT)
 
-            log("Service & characteristics found. Enabling notifications (queued)…")
             notifyQueue.clear()
             chStatus?.let { notifyQueue.addLast(it) }
             chRange?.let  { notifyQueue.addLast(it) }
             chSprint?.let { notifyQueue.addLast(it) }
-            enableNextNotify() // kick off first CCCD write
+            enableNextNotify()
         }
 
         override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
@@ -344,57 +429,37 @@ class MainActivity : ComponentActivity() {
             if (status == BluetoothGatt.GATT_SUCCESS) handleCharacteristic(characteristic)
         }
 
-        override fun onCharacteristicWrite(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            log("WRITE callback for ${characteristic.uuid}: status=$status")
-        }
-
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            // One CCCD finished -> pop and do the next
             notifyQueue.firstOrNull()?.let { first ->
-                if (first.getDescriptor(CCCD_UUID) == descriptor) {
-                    notifyQueue.removeFirst()
-                }
+                if (first.getDescriptor(CCCD_UUID) == descriptor) notifyQueue.removeFirst()
             }
             enableNextNotify()
         }
     }
 
-    // ---- Sequential CCCD writer + initial reads + start polling when done
+    // CCCD writes in sequence; then initial reads and start polling
     private fun enableNextNotify() {
         val g = gatt ?: return
         val ch = notifyQueue.firstOrNull() ?: run {
-            // All CCCDs done → do initial reads now and start polling
             chStatus?.let { g.readCharacteristic(it) }
             chRange?.let  { g.readCharacteristic(it) }
             chSprint?.let { g.readCharacteristic(it) }
-            log("Notifications enabled for all; issued initial reads.")
             startPolling()
             return
         }
 
         if ((ch.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) == 0) {
-            log("Characteristic ${ch.uuid} has no NOTIFY property; skipping.")
-            notifyQueue.removeFirst()
-            enableNextNotify()
-            return
+            notifyQueue.removeFirst(); enableNextNotify(); return
         }
 
         g.setCharacteristicNotification(ch, true)
         val cccd = ch.getDescriptor(CCCD_UUID)
         if (cccd == null) {
-            log("No CCCD on ${ch.uuid}; skipping.")
-            notifyQueue.removeFirst()
-            enableNextNotify()
-            return
+            notifyQueue.removeFirst(); enableNextNotify(); return
         }
-
         cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        val ok = g.writeDescriptor(cccd)
-        log("Writing CCCD for ${ch.uuid} (ok=$ok)")
-        if (!ok) {
-            // If immediate write failed, drop and continue
-            notifyQueue.removeFirst()
-            enableNextNotify()
+        if (!g.writeDescriptor(cccd)) {
+            notifyQueue.removeFirst(); enableNextNotify()
         }
     }
 
@@ -406,70 +471,102 @@ class MainActivity : ComponentActivity() {
         handler.removeCallbacks(pollRunnable)
     }
 
-    private fun formatHms(ms: Long): String {
-        val totalSec = ms / 1000
-        val h = totalSec / 3600
-        val m = (totalSec % 3600) / 60
-        val s = totalSec % 60
-        return String.format("%d:%02d:%02d (%d ms)", h, m, s, ms)
-    }
-
+    // ================= Parse incoming characteristics =================
     private fun handleCharacteristic(ch: BluetoothGattCharacteristic) {
         when (ch.uuid) {
             UUID_STATUS -> {
                 val s = ch.value?.toString(Charsets.UTF_8) ?: return
                 try {
                     val j = JSONObject(s)
-                    _laserOn.value   = j.optBoolean("laser", false)
-                    _autoMode.value  = j.optBoolean("auto", true) // your JSON: true means auto mode
-                    _rangeCm.value   = if (j.has("lidar_cm")) j.optInt("lidar_cm") else _rangeCm.value
-                    _haveStart.value = j.optBoolean("have_start", false)
-                    _sprintMs.value  = if (j.has("sprint_ms")) j.optLong("sprint_ms") else _sprintMs.value
-                    _uptimeMs.value  = if (j.has("uptime")) j.optLong("uptime") else _uptimeMs.value
-                    log("STATUS: $s")
-                } catch (e: Exception) {
-                    log("Bad STATUS JSON: ${e.message}")
-                }
+
+                    // ---- have_start edge detection ----
+                    val haveStartNew = j.optBoolean("have_start", false)
+                    val rising  = (!haveStartPrev && haveStartNew)
+                    val falling = (haveStartPrev && !haveStartNew)
+                    haveStartPrev = haveStartNew
+
+                    if (rising) {
+                        // NEW RUN
+                        runId += 1
+                        pendingSprintMs = null
+                        pendingSprintRunId = runId
+
+                        _finalSprintMsFromDevice.value = null
+                        _frozenMph.value = null
+
+                        lockedRangeYardsSnapshot = currentCalcRangeYardsProvider?.invoke()
+                        rangeLocked.value = true
+
+                        startMonotonicMs = System.currentTimeMillis()
+                        _liveElapsedMs.value = 0L
+                        _isRunActive.value = true
+                    }
+
+                    if (falling) {
+                        // FINISH — stop/zero big timer now, then finalize after grace
+                        _isRunActive.value = false
+                        startMonotonicMs = null
+                        _liveElapsedMs.value = 0L
+
+                        val thisRun = runId
+                        handler.postDelayed({
+                            // Only finalize if we haven't started a new run meanwhile
+                            if (runId == thisRun) {
+                                val deviceMs = if (pendingSprintRunId == thisRun) pendingSprintMs else null
+                                _finalSprintMsFromDevice.value = deviceMs
+
+                                val yards = lockedRangeYardsSnapshot
+                                _frozenMph.value = if (deviceMs != null && deviceMs > 0 && yards != null && yards > 0.0) {
+                                    val sec = deviceMs / 1000.0
+                                    yards * 3600.0 / (1760.0 * sec)
+                                } else null
+
+                                lockedRangeYardsSnapshot = null
+                                rangeLocked.value = false
+                            }
+                        }, 250L) // grace window for late SPRINT packet
+                    }
+
+                    // lidar from STATUS (optional)
+                    if (j.has("lidar_cm")) {
+                        val cm = j.optInt("lidar_cm")
+                        _lidarCm.value = if (cm == 0xFFFF) null else cm
+                    }
+
+                    // If firmware also surfaces sprint_ms in STATUS, record it for this run
+                    if (j.has("sprint_ms")) {
+                        val sm = j.optLong("sprint_ms")
+                        if (sm > 0) {
+                            pendingSprintMs = sm
+                            pendingSprintRunId = runId
+                        }
+                    }
+                } catch (_: Exception) { /* ignore malformed JSON */ }
             }
+
             UUID_RANGE -> {
                 val b = ch.value ?: return
                 if (b.size >= 2) {
                     val cm = ByteBuffer.wrap(b.copyOfRange(0, 2))
                         .order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
-                    _rangeCm.value = if (cm == 0xFFFF) null else cm
-                    log("RANGE notify: ${_rangeCm.value ?: "n/a"} cm")
+                    _lidarCm.value = if (cm == 0xFFFF) null else cm
                 }
             }
+
             UUID_SPRINT -> {
                 val b = ch.value ?: return
                 if (b.size >= 4) {
-                    val ms = ByteBuffer.wrap(b.copyOfRange(0, 4))
-                        .order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
-                    _sprintMs.value = ms
-                    log("SPRINT notify: $ms ms")
+                    val raw = ByteBuffer.wrap(b.copyOfRange(0, 4))
+                        .order(ByteOrder.LITTLE_ENDIAN).int
+                    val deviceMs = raw.toLong() and 0xFFFFFFFFL
+                    if (deviceMs > 0) {
+                        pendingSprintMs = deviceMs
+                        pendingSprintRunId = runId
+                    }
                 }
             }
         }
     }
-
-    private fun writeControlJson(json: String) {
-        if (!_connected.value) { log("Not connected."); return }
-        val ch = chControl ?: run { log("CONTROL characteristic missing."); return }
-        if (!hasAllNeededPermissions()) { requestNeededPermissions(); return }
-
-        ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT // write with response
-        ch.value = json.toByteArray(Charsets.UTF_8)
-        val ok = gatt?.writeCharacteristic(ch) ?: false
-        log("Write CONTROL: $json (ok=$ok)")
-
-        // Read STATUS shortly after to observe effect (covers cases where notify is slow)
-        if (ok) {
-            handler.postDelayed({
-                chStatus?.let { gatt?.readCharacteristic(it) }
-            }, 150)
-        }
-    }
-
 
     // ================= Permissions =================
     private fun hasAllNeededPermissions(): Boolean {
@@ -489,7 +586,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        stopScan()
+        if (scanning) stopScan()
         disconnectGatt()
     }
 }
