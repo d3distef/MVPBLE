@@ -15,23 +15,97 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import androidx.room.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.ArrayDeque
-import java.util.UUID
+import java.text.SimpleDateFormat
+import java.util.*
 import kotlin.math.max
+import kotlin.math.min
+
+// ========================= Room (DB) =========================
+
+@Entity(tableName = "users")
+data class UserEntity(
+    @PrimaryKey val name: String,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "runs")
+data class RunEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0L,
+    val userName: String,
+    val sprintMs: Long,
+    val rangeYards: Double,
+    val mph: Double,
+    val timestamp: Long
+)
+
+@Dao
+interface UserDao {
+    @Query("SELECT * FROM users ORDER BY name ASC")
+    fun observeAll(): Flow<List<UserEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insert(user: UserEntity)
+}
+
+@Dao
+interface RunDao {
+    @Query("SELECT * FROM runs ORDER BY timestamp DESC")
+    fun observeAll(): Flow<List<RunEntity>>
+
+    @Query("SELECT * FROM runs WHERE userName = :user ORDER BY timestamp DESC")
+    fun observeForUser(user: String): Flow<List<RunEntity>>
+
+    @Insert
+    suspend fun insert(run: RunEntity)
+}
+
+@Database(entities = [UserEntity::class, RunEntity::class], version = 1)
+abstract class AppDb : RoomDatabase() {
+    abstract fun userDao(): UserDao
+    abstract fun runDao(): RunDao
+
+    companion object {
+        @Volatile private var INSTANCE: AppDb? = null
+        fun get(context: Context): AppDb =
+            INSTANCE ?: synchronized(this) {
+                Room.databaseBuilder(context.applicationContext, AppDb::class.java, "sprints.db")
+                    .build().also { INSTANCE = it }
+            }
+    }
+}
+
+// ========================= Activity =========================
 
 class MainActivity : ComponentActivity() {
 
@@ -62,14 +136,14 @@ class MainActivity : ComponentActivity() {
     private val _scanning  = mutableStateOf(false)
     private val _found     = mutableStateOf(false)
 
-    private val _lidarCm   = mutableStateOf<Int?>(null)     // from RANGE or STATUS.lidar_cm
+    private val _lidarCm   = mutableStateOf<Int?>(null)
 
     // Live timer (big center) — independent
     private var startMonotonicMs: Long? = null
     private val _liveElapsedMs = mutableStateOf(0L)
     private val _isRunActive   = mutableStateOf(false)
 
-    // Device sprint result & frozen MPH (shown in "Results")
+    // Device sprint result & frozen MPH
     private val _finalSprintMsFromDevice = mutableStateOf<Long?>(null)
     private val _frozenMph = mutableStateOf<Double?>(null)
 
@@ -84,6 +158,12 @@ class MainActivity : ComponentActivity() {
 
     // Track previous have_start to detect edges
     private var haveStartPrev = false
+
+    // Selected user (set from Compose)
+    @Volatile private var selectedUserName: String? = null
+
+    // DB
+    private lateinit var db: AppDb
 
     // Lightweight polling
     private val pollIntervalMs = 800L
@@ -111,6 +191,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        db = AppDb.get(this)
+
         val bm = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bm.adapter
 
@@ -121,86 +203,44 @@ class MainActivity : ComponentActivity() {
                         .fillMaxSize()
                         .windowInsetsPadding(WindowInsets.safeDrawing)
                 ) {
-                    val connected by _connected
-                    val scanningState by _scanning
-                    val found by _found
+                    // Simple 2-screen navigator
+                    var screen by remember { mutableStateOf<Screen>(Screen.Main) }
 
-                    val lidarCm by _lidarCm
-                    val lidarYards = remember(lidarCm) { lidarCm?.let { it / 91.44 } }
-
-                    val isRunActive by _isRunActive
-                    val liveTimerMs by _liveElapsedMs
-                    val finalDeviceSprintMs by _finalSprintMsFromDevice
-                    val frozenMph by _frozenMph
-
-                    // Range controls (textbox is user-facing truth when not using LiDAR)
-                    var useLidar by remember { mutableStateOf(true) }
-                    var calcText by remember { mutableStateOf("") }
-                    var calcYards by remember { mutableStateOf<Double?>(null) }
-
-                    // Keep textbox mirrored to LiDAR while unlocked & using LiDAR
-                    LaunchedEffect(lidarYards, useLidar, rangeLocked.value) {
-                        if (!rangeLocked.value && useLidar) {
-                            calcYards = lidarYards
-                            calcText = lidarYards?.let { String.format("%.2f", it) } ?: ""
-                        }
-                    }
-
-                    // Tick big timer only when a run is active
+                    // ==== LIVE TICK LOOP (restored) ====
+                    val isRunActive by remember { derivedStateOf { _isRunActive.value } }
                     LaunchedEffect(isRunActive) {
                         if (isRunActive) {
                             while (_isRunActive.value) {
                                 startMonotonicMs?.let { t0 ->
                                     _liveElapsedMs.value = max(0, System.currentTimeMillis() - t0)
                                 }
-                                kotlinx.coroutines.delay(16L)
+                                delay(16L)
                             }
                         }
                     }
 
-                    MainScreen(
-                        scanning = scanningState,
-                        connected = connected,
-                        found = found,
-                        foundName = lastFoundName,
-                        onScan = { onScanClicked() },
-                        onConnect = { connectToLastFound() },
-
-                        lidarYards = lidarYards,
-
-                        useLidar = useLidar,
-                        onUseLidarToggle = { checked ->
-                            if (!rangeLocked.value) {
-                                useLidar = checked
-                                if (checked) {
-                                    calcYards = lidarYards
-                                    calcText = lidarYards?.let { String.format("%.2f", it) } ?: ""
-                                }
-                            }
-                        },
-
-                        calcText = calcText,
-                        onCalcTextChange = { txt ->
-                            if (!rangeLocked.value && !useLidar) {
-                                val clean = txt.filter { it.isDigit() || it == '.' }
-                                calcText = clean
-                                calcYards = clean.toDoubleOrNull()
-                            }
-                        },
-
-                        rangeLocked = rangeLocked.value,
-
-                        // Big timer is purely live
-                        liveTimerMs = liveTimerMs,
-
-                        // Results show ONLY the final device time & frozen MPH (after finish)
-                        finalDeviceSprintMs = finalDeviceSprintMs,
-                        frozenMph = frozenMph
-                    )
-
-                    // Range snapshot provider for locking at START
-                    currentCalcRangeYardsProvider = {
-                        if (useLidar) (lidarYards ?: calcYards) else calcYards
+                    when (val s = screen) {
+                        is Screen.Main -> MainScreenHost(
+                            db = db,
+                            onNavigateHistory = { screen = Screen.History },
+                            onScan = { onScanClicked() },
+                            onConnect = { connectToLastFound() },
+                            connected = _connected.value,
+                            scanning = _scanning.value,
+                            found = _found.value,
+                            foundName = lastFoundName,
+                            lidarCm = _lidarCm.value,
+                            liveTimerMs = _liveElapsedMs.value,
+                            finalDeviceSprintMs = _finalSprintMsFromDevice.value,
+                            frozenMph = _frozenMph.value,
+                            rangeLocked = rangeLocked.value,
+                            onSelectedUserChanged = { selectedUserName = it },
+                            provideCalcRangeYards = { currentCalcRangeYardsProvider?.invoke() }
+                        )
+                        is Screen.History -> HistoryScreenHost(
+                            db = db,
+                            onBack = { screen = Screen.Main }
+                        )
                     }
                 }
             }
@@ -210,38 +250,163 @@ class MainActivity : ComponentActivity() {
     // Provider set in composition to read the current calc range when locking
     private var currentCalcRangeYardsProvider: (() -> Double?)? = null
 
-    // ================= UI host =================
+    // ================= Screens =================
+
+    private sealed class Screen {
+        object Main : Screen()
+        object History : Screen()
+    }
+
+    @OptIn(ExperimentalMaterial3Api::class)
     @Composable
-    private fun MainScreen(
-        scanning: Boolean,
-        connected: Boolean,
-        found: Boolean,
-        foundName: String?,
+    private fun MainScreenHost(
+        db: AppDb,
+        onNavigateHistory: () -> Unit,
         onScan: () -> Unit,
         onConnect: () -> Unit,
-
-        lidarYards: Double?,
-
-        useLidar: Boolean,
-        onUseLidarToggle: (Boolean) -> Unit,
-
-        calcText: String,
-        onCalcTextChange: (String) -> Unit,
-
-        rangeLocked: Boolean,
-
+        connected: Boolean,
+        scanning: Boolean,
+        found: Boolean,
+        foundName: String?,
+        lidarCm: Int?,
         liveTimerMs: Long,
         finalDeviceSprintMs: Long?,
-        frozenMph: Double?
+        frozenMph: Double?,
+        rangeLocked: Boolean,
+        onSelectedUserChanged: (String?) -> Unit,
+        provideCalcRangeYards: () -> Double?
     ) {
+        val context = LocalContext.current
+
+        // Users stream
+        val allUsers by produceState(initialValue = emptyList<UserEntity>()) {
+            db.userDao().observeAll().collectLatest { value = it }
+        }
+
+        // Ensure "Unassigned" exists for safety
+        LaunchedEffect(Unit) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                db.userDao().insert(UserEntity("Unassigned"))
+            }
+        }
+
+        // Selection + add-user UI state
+        var selectedUser by remember { mutableStateOf<String?>("Unassigned") }
+        var addingUser by remember { mutableStateOf(false) }
+        var newUserText by remember { mutableStateOf("") }
+
+        // Keep activity field updated so the finalize path can persist correctly
+        LaunchedEffect(selectedUser) { onSelectedUserChanged(selectedUser) }
+
+        // Convert LiDAR cm → yards
+        val lidarYards = remember(lidarCm) { lidarCm?.let { it / 91.44 } }
+
+        // Range controls (textbox is truth when not using LiDAR)
+        var useLidar by remember { mutableStateOf(true) }
+        var calcText by remember { mutableStateOf("") }
+        var calcYards by remember { mutableStateOf<Double?>(null) }
+
+        // Keep textbox mirrored to LiDAR while unlocked & using LiDAR
+        LaunchedEffect(lidarYards, useLidar, rangeLocked) {
+            if (!rangeLocked && useLidar) {
+                calcYards = lidarYards
+                calcText = lidarYards?.let { String.format("%.2f", it) } ?: ""
+            }
+        }
+
+        // Expose current calc range for START locking
+        LaunchedEffect(useLidar, calcYards, lidarYards, rangeLocked) {
+            currentCalcRangeYardsProvider = {
+                if (useLidar) (lidarYards ?: calcYards) else calcYards
+            }
+        }
+
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+            modifier = Modifier.fillMaxSize().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Top row: Scan / Connect
+            // Top bar
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Sprint Beacon", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                TextButton(onClick = onNavigateHistory) { Text("History") }
+            }
+
+            // User picker + Add user
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Runner", style = MaterialTheme.typography.titleMedium)
+
+                    if (addingUser) {
+                        OutlinedTextField(
+                            value = newUserText,
+                            onValueChange = { newUserText = it },
+                            label = { Text("Add new user") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Text,
+                                imeAction = ImeAction.Done
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onDone = {
+                                    val name = newUserText.trim()
+                                    if (name.isNotEmpty()) {
+                                        lifecycleScope.launch(Dispatchers.IO) {
+                                            db.userDao().insert(UserEntity(name))
+                                        }
+                                        selectedUser = name
+                                        newUserText = ""
+                                        addingUser = false
+                                    } else {
+                                        addingUser = false
+                                    }
+                                }
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    } else {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            var expanded by remember { mutableStateOf(false) }
+                            ExposedDropdownMenuBox(
+                                expanded = expanded,
+                                onExpandedChange = { expanded = it },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                OutlinedTextField(
+                                    value = selectedUser ?: "",
+                                    onValueChange = {},
+                                    readOnly = true,
+                                    label = { Text("Select user") },
+                                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+                                    modifier = Modifier.menuAnchor().fillMaxWidth()
+                                )
+                                ExposedDropdownMenu(
+                                    expanded = expanded,
+                                    onDismissRequest = { expanded = false }
+                                ) {
+                                    allUsers.forEach { u ->
+                                        DropdownMenuItem(
+                                            text = { Text(u.name) },
+                                            onClick = {
+                                                selectedUser = u.name
+                                                expanded = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+
+                            TextButton(onClick = { addingUser = true }) {
+                                Text("Add user")
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Scan / Connect
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -249,16 +414,15 @@ class MainActivity : ComponentActivity() {
                 Button(
                     modifier = Modifier.weight(1f),
                     onClick = onScan,
-                    enabled = !scanning && !connected
+                    enabled = !_scanning.value && !_connected.value
                 ) { Text(if (scanning) "Scanning…" else "Scan") }
 
                 val connectLabel = when {
                     connected -> "Connected"
-                    found && foundName != null -> "Connect to $foundName"
+                    found && (foundName != null) -> "Connect to $foundName"
                     found -> "Connect to device"
                     else -> "Connect"
                 }
-
                 Button(
                     modifier = Modifier.weight(1f),
                     onClick = onConnect,
@@ -279,7 +443,15 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Checkbox(
                             checked = useLidar,
-                            onCheckedChange = onUseLidarToggle,
+                            onCheckedChange = { checked ->
+                                if (!rangeLocked) {
+                                    useLidar = checked
+                                    if (checked) {
+                                        calcYards = lidarYards
+                                        calcText = lidarYards?.let { String.format("%.2f", it) } ?: ""
+                                    }
+                                }
+                            },
                             enabled = !rangeLocked
                         )
                         Text("Use LiDAR for calculations")
@@ -287,7 +459,13 @@ class MainActivity : ComponentActivity() {
 
                     OutlinedTextField(
                         value = calcText,
-                        onValueChange = onCalcTextChange,
+                        onValueChange = { txt ->
+                            if (!rangeLocked && !useLidar) {
+                                val clean = txt.filter { it.isDigit() || it == '.' }
+                                calcText = clean
+                                calcYards = clean.toDoubleOrNull()
+                            }
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("Calc range (yards)") },
                         enabled = !useLidar && !rangeLocked,
@@ -315,6 +493,177 @@ class MainActivity : ComponentActivity() {
                     Text("Sprint time (s): ${finalDeviceSprintMs?.let { String.format("%.3f", it / 1000.0) } ?: "-"}")
                     Text("Average MPH: ${frozenMph?.let { String.format("%.2f", it) } ?: "-"}")
                 }
+            }
+        }
+
+        // Supply current calc range provider up to activity
+        currentCalcRangeYardsProvider = { if (useLidar) (lidarYards ?: calcYards) else calcYards }
+    }
+
+    @OptIn(ExperimentalMaterial3Api::class)
+    @Composable
+    private fun HistoryScreenHost(
+        db: AppDb,
+        onBack: () -> Unit
+    ) {
+        val allUsers by produceState(initialValue = emptyList<UserEntity>()) {
+            db.userDao().observeAll().collectLatest { value = it }
+        }
+        var selected by remember { mutableStateOf<String?>("All") }
+
+        val runs: List<RunEntity> by produceState(initialValue = emptyList()) {
+            if (selected == null || selected == "All") {
+                db.runDao().observeAll().collectLatest { value = it }
+            } else {
+                db.runDao().observeForUser(selected!!).collectLatest { value = it }
+            }
+        }
+
+        Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onBack) { Text("← Back") }
+                Text("History", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.width(48.dp))
+            }
+
+            // User filter
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                var expanded by remember { mutableStateOf(false) }
+                ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+                    OutlinedTextField(
+                        value = selected ?: "All",
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("Filter user") },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+                        modifier = Modifier.menuAnchor().fillMaxWidth()
+                    )
+                    ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                        DropdownMenuItem(text = { Text("All") }, onClick = { selected = "All"; expanded = false })
+                        allUsers.forEach { u ->
+                            DropdownMenuItem(text = { Text(u.name) }, onClick = { selected = u.name; expanded = false })
+                        }
+                    }
+                }
+            }
+
+            // Charts
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Average MPH over time")
+                    LineChart(
+                        data = runs.map { it.timestamp to it.mph },
+                        yLabel = "MPH"
+                    )
+                }
+            }
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("MPH vs Range")
+                    ScatterChart(
+                        points = runs.map { it.rangeYards to it.mph },
+                        xLabel = "Range (yd)",
+                        yLabel = "MPH"
+                    )
+                }
+            }
+
+            // List
+            Card(Modifier.fillMaxSize()) {
+                val fmt = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
+                LazyColumn(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(runs) { r ->
+                        Column {
+                            Text("${fmt.format(Date(r.timestamp))} — ${r.userName}", fontWeight = FontWeight.SemiBold)
+                            Text("Sprint: ${String.format("%.3f s", r.sprintMs / 1000.0)}  |  Range: ${String.format("%.2f yd", r.rangeYards)}  |  MPH: ${String.format("%.2f", r.mph)}")
+                        }
+                        Divider(Modifier.padding(top = 8.dp))
+                    }
+                }
+            }
+        }
+    }
+
+    // ================= Simple charts (Canvas) =================
+
+    @Composable
+    private fun LineChart(
+        data: List<Pair<Long, Double>>,
+        yLabel: String,
+        modifier: Modifier = Modifier
+            .fillMaxWidth()
+            .height(180.dp)
+            .padding(6.dp)
+    ) {
+        if (data.isEmpty()) {
+            Box(modifier, contentAlignment = Alignment.Center) { Text("No data") }
+            return
+        }
+        val xs = data.map { it.first.toDouble() }
+        the@run {
+            val ys = data.map { it.second }
+            val xMin = xs.minOrNull() ?: 0.0
+            val xMax = xs.maxOrNull() ?: 1.0
+            val yMin = min(ys.minOrNull() ?: 0.0, 0.0)
+            val yMax = max(ys.maxOrNull() ?: 1.0, 1.0)
+            Canvas(modifier) {
+                val pad = 32f
+                val w = size.width - pad * 2
+                val h = size.height - pad * 2
+                if (w <= 0 || h <= 0) return@Canvas
+
+                drawLine(Color.Gray, start = androidx.compose.ui.geometry.Offset(pad, size.height - pad),
+                    end = androidx.compose.ui.geometry.Offset(size.width - pad, size.height - pad))
+                drawLine(Color.Gray, start = androidx.compose.ui.geometry.Offset(pad, pad),
+                    end = androidx.compose.ui.geometry.Offset(pad, size.height - pad))
+
+                val path = Path()
+                data.sortedBy { it.first }.forEachIndexed { idx, (tx, yv) ->
+                    val x = pad + ((tx - xMin) / (xMax - xMin).coerceAtLeast(1.0)) * w
+                    val y = size.height - pad - ((yv - yMin) / (yMax - yMin).coerceAtLeast(1.0)) * h
+                    if (idx == 0) path.moveTo(x.toFloat(), y.toFloat()) else path.lineTo(x.toFloat(), y.toFloat())
+                }
+                drawPath(path, Color(0xFF90CAF9), style = Stroke(width = 4f, cap = StrokeCap.Round))
+            }
+        }
+    }
+
+    @Composable
+    private fun ScatterChart(
+        points: List<Pair<Double, Double>>,
+        xLabel: String,
+        yLabel: String,
+        modifier: Modifier = Modifier
+            .fillMaxWidth()
+            .height(180.dp)
+            .padding(6.dp)
+    ) {
+        if (points.isEmpty()) {
+            Box(modifier, contentAlignment = Alignment.Center) { Text("No data") }
+            return
+        }
+        val xs = points.map { it.first }
+        val ys = points.map { it.second }
+        val xMin = xs.minOrNull() ?: 0.0
+        val xMax = xs.maxOrNull() ?: 1.0
+        val yMin = ys.minOrNull() ?: 0.0
+        val yMax = ys.maxOrNull() ?: 1.0
+
+        Canvas(modifier) {
+            val pad = 32f
+            val w = size.width - pad * 2
+            val h = size.height - pad * 2
+            if (w <= 0 || h <= 0) return@Canvas
+
+            drawLine(Color.Gray, start = androidx.compose.ui.geometry.Offset(pad, size.height - pad),
+                end = androidx.compose.ui.geometry.Offset(size.width - pad, size.height - pad))
+            drawLine(Color.Gray, start = androidx.compose.ui.geometry.Offset(pad, pad),
+                end = androidx.compose.ui.geometry.Offset(pad, size.height - pad))
+
+            points.forEach { (xv, yv) ->
+                val x = pad + ((xv - xMin) / (xMax - xMin).coerceAtLeast(1.0)) * w
+                val y = size.height - pad - ((yv - yMin) / (yMax - yMin).coerceAtLeast(1.0)) * h
+                drawCircle(Color(0xFFFFCC80), radius = 6f, center = androidx.compose.ui.geometry.Offset(x.toFloat(), y.toFloat()))
             }
         }
     }
@@ -516,10 +865,30 @@ class MainActivity : ComponentActivity() {
                                 _finalSprintMsFromDevice.value = deviceMs
 
                                 val yards = lockedRangeYardsSnapshot
-                                _frozenMph.value = if (deviceMs != null && deviceMs > 0 && yards != null && yards > 0.0) {
+                                val mph = if (deviceMs != null && deviceMs > 0 && yards != null && yards > 0.0) {
                                     val sec = deviceMs / 1000.0
                                     yards * 3600.0 / (1760.0 * sec)
                                 } else null
+                                _frozenMph.value = mph
+
+                                // Persist to DB
+                                val user = (selectedUserName ?: "Unassigned").ifBlank { "Unassigned" }
+                                val ts = System.currentTimeMillis()
+                                if (deviceMs != null && yards != null && mph != null) {
+                                    lifecycleScope.launch(Dispatchers.IO) {
+                                        // Ensure user exists
+                                        db.userDao().insert(UserEntity(user))
+                                        db.runDao().insert(
+                                            RunEntity(
+                                                userName = user,
+                                                sprintMs = deviceMs,
+                                                rangeYards = yards,
+                                                mph = mph,
+                                                timestamp = ts
+                                            )
+                                        )
+                                    }
+                                }
 
                                 lockedRangeYardsSnapshot = null
                                 rangeLocked.value = false
