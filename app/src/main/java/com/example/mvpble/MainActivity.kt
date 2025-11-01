@@ -114,6 +114,7 @@ class MainActivity : ComponentActivity() {
     private val UUID_STATUS  = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0b2") // READ|NOTIFY (JSON)
     private val UUID_RANGE   = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0d4") // READ|NOTIFY (uint16 cm)
     private val UUID_SPRINT  = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0f6") // READ|NOTIFY (uint32 ms)
+    private val UUID_CONTROL = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0c3") // WRITE (JSON)  ← added
     private val CCCD_UUID    = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     // ===== BLE plumbing =====
@@ -126,6 +127,7 @@ class MainActivity : ComponentActivity() {
     private var chStatus:  BluetoothGattCharacteristic? = null
     private var chRange:   BluetoothGattCharacteristic? = null
     private var chSprint:  BluetoothGattCharacteristic? = null
+    private var chControl: BluetoothGattCharacteristic? = null // ← added
     private val notifyQueue: ArrayDeque<BluetoothGattCharacteristic> = ArrayDeque()
 
     private var lastFoundMac: String? = null
@@ -223,6 +225,7 @@ class MainActivity : ComponentActivity() {
                             onNavigateHistory = { screen = Screen.History },
                             onScan = { onScanClicked() },
                             onConnect = { connectToLastFound() },
+                            onArm = { sendArmCommand() }, // ← added
                             connected = _connected.value,
                             scanning = _scanning.value,
                             found = _found.value,
@@ -259,6 +262,7 @@ class MainActivity : ComponentActivity() {
         onNavigateHistory: () -> Unit,
         onScan: () -> Unit,
         onConnect: () -> Unit,
+        onArm: () -> Unit, // ← added
         connected: Boolean,
         scanning: Boolean,
         found: Boolean,
@@ -401,7 +405,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Scan / Connect (unchanged)
+            // Scan / Connect / ARM
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -423,6 +427,12 @@ class MainActivity : ComponentActivity() {
                     onClick = onConnect,
                     enabled = !connected && found
                 ) { Text(connectLabel) }
+
+                Button(
+                    modifier = Modifier.weight(1f),
+                    onClick = onArm,
+                    enabled = connected
+                ) { Text("ARM / START") }
             }
 
             // Ranges block
@@ -714,7 +724,7 @@ class MainActivity : ComponentActivity() {
         override fun onScanFailed(errorCode: Int) { stopScan() }
     }
 
-    // ================= Connect & discover (unchanged) =================
+    // ================= Connect & discover (unchanged + control hookup) =================
     private fun connectToLastFound() {
         val mac = lastFoundMac ?: return
         if (!hasAllNeededPermissions()) { requestNeededPermissions(); return }
@@ -728,7 +738,7 @@ class MainActivity : ComponentActivity() {
         gatt?.let { it.disconnect(); it.close() }
         gatt = null
         _connected.value = false
-        chStatus = null; chRange = null; chSprint = null
+        chStatus = null; chRange = null; chSprint = null; chControl = null // ← clear control
         notifyQueue.clear()
     }
 
@@ -752,9 +762,10 @@ class MainActivity : ComponentActivity() {
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) return
             val svc = gatt.getService(SERVICE_UUID) ?: return
-            chStatus = svc.getCharacteristic(UUID_STATUS)
-            chRange  = svc.getCharacteristic(UUID_RANGE)
-            chSprint = svc.getCharacteristic(UUID_SPRINT)
+            chStatus  = svc.getCharacteristic(UUID_STATUS)
+            chRange   = svc.getCharacteristic(UUID_RANGE)
+            chSprint  = svc.getCharacteristic(UUID_SPRINT)
+            chControl = svc.getCharacteristic(UUID_CONTROL) // ← added
 
             notifyQueue.clear()
             chStatus?.let { notifyQueue.addLast(it) }
@@ -926,6 +937,20 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    // ================= Control write (ARM / START) =================
+    private fun sendArmCommand() {
+        val g = gatt ?: return
+        val c = chControl ?: return
+        c.value = """{"arm":1}""".toByteArray(Charsets.UTF_8)
+
+        // Prefer write-with-response; fallback to no-response if needed.
+        c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        if (!g.writeCharacteristic(c)) {
+            c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            g.writeCharacteristic(c)
         }
     }
 
