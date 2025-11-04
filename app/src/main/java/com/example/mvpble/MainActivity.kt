@@ -1,6 +1,7 @@
 package com.example.mvpble
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
@@ -35,6 +36,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.content.pm.ActivityInfo
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.room.*
@@ -50,7 +53,17 @@ import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.max
 import kotlin.math.min
-
+// ===== Imports you need somewhere at top of file =====
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.sp
 // ========================= Room (DB) =========================
 
 @Entity(tableName = "users")
@@ -108,6 +121,16 @@ abstract class AppDb : RoomDatabase() {
 // ========================= Activity =========================
 
 class MainActivity : ComponentActivity() {
+
+    // --- App navigation + connection name ---
+    private enum class Screen { Connect, Main, History }
+    private val _screen = mutableStateOf(Screen.Connect)
+    private val _connectedName = mutableStateOf<String?>(null)
+
+    // --- Discovered beacons list for Connect screen ---
+    private data class Beacon(val mac: String, val name: String, val rssi: Int)
+    private val beacons = mutableStateListOf<Beacon>()
+
 
     // ===== BLE UUIDs (ESP32) =====
     private val SERVICE_UUID = UUID.fromString("b8c7f3f4-4b9f-4a5b-9c39-36c6b4c7e0a1")
@@ -204,7 +227,21 @@ class MainActivity : ComponentActivity() {
                         .windowInsetsPadding(WindowInsets.safeDrawing)
                 ) {
                     // Simple 2-screen navigator (Main / History)
-                    var screen by remember { mutableStateOf<Screen>(Screen.Main) }
+                    val screen by _screen
+
+                    // === Persisted UI state (survives nav/rotation) ===
+                    var selectedUserSave by rememberSaveable { mutableStateOf<String?>("Unassigned") }
+                    var manualRangeTextSave by rememberSaveable { mutableStateOf("") }   // textbox truth
+                    var useLidarSave by rememberSaveable { mutableStateOf(true) }        // checkbox truth
+
+
+                    // Lock Main to portrait; allow rotation on History
+                    LaunchedEffect(screen) {
+                        requestedOrientation = if (_screen.value == Screen.Main)
+                            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                        else
+                            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    }
 
                     // Tick big timer only when a run is active (unchanged)
                     val isRunActive by remember { derivedStateOf { _isRunActive.value } }
@@ -220,27 +257,40 @@ class MainActivity : ComponentActivity() {
                     }
 
                     when (screen) {
+                        Screen.Connect -> ConnectScreenHost(
+                            scanning = _scanning.value,
+                            beacons = beacons,
+                            onScan = { onScanClicked() },
+                            onConnect = { mac, name -> connectTo(mac, name) }   // new function below
+                        )
                         Screen.Main -> MainScreenHost(
                             db = db,
-                            onNavigateHistory = { screen = Screen.History },
-                            onScan = { onScanClicked() },
-                            onConnect = { connectToLastFound() },
-                            onArm = { sendArmCommand() }, // ← added
+                            onNavigateHistory = { _screen.value = Screen.History },
+                            connectedName = _connectedName.value,   // NEW
+                            onArm = { sendArmCommand() },
                             connected = _connected.value,
-                            scanning = _scanning.value,
-                            found = _found.value,
-                            foundName = lastFoundName,
                             lidarCm = _lidarCm.value,
                             liveTimerMs = _liveElapsedMs.value,
                             finalDeviceSprintMs = _finalSprintMsFromDevice.value,
                             frozenMph = _frozenMph.value,
                             rangeLocked = rangeLocked.value,
-                            onSelectedUserChanged = { selectedUserName = it },
+
+                            // NEW: state hoisted to root and saved
+                            selectedUser = selectedUserSave,
+                            onSelectedUserChanged = { selectedUserSave = it; selectedUserName = it },
+
+                            manualRangeText = manualRangeTextSave,
+                            onManualRangeTextChanged = { manualRangeTextSave = it },
+
+                            useLidar = useLidarSave,
+                            onUseLidarChanged = { useLidarSave = it },
+
                             provideCalcRangeYards = { currentCalcRangeYardsProvider?.invoke() }
                         )
+
                         Screen.History -> HistoryScreenHost(
                             db = db,
-                            onBack = { screen = Screen.Main }
+                            onBack = { _screen.value = Screen.Main }
                         )
                     }
                 }
@@ -252,29 +302,86 @@ class MainActivity : ComponentActivity() {
     private var currentCalcRangeYardsProvider: (() -> Double?)? = null
 
     // ================= Screens (User features) =================
+    @OptIn(ExperimentalMaterial3Api::class)
+    @Composable
+    private fun ConnectScreenHost(
+        scanning: Boolean,
+        beacons: List<Beacon>,
+        onScan: () -> Unit,
+        onConnect: (mac: String, name: String?) -> Unit
+    ) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Text("Bluetooth Connect", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
 
-    private enum class Screen { Main, History }
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = onScan,
+                enabled = !scanning
+            ) {
+                Text(if (scanning) "Scanning…" else "Scan")
+            }
+
+            Card(Modifier.fillMaxSize()) {
+                if (beacons.isEmpty()) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text(if (scanning) "Scanning for SprintBeacons…" else "No devices yet. Tap Scan.")
+                    }
+                } else {
+                    LazyColumn(
+                        Modifier
+                            .fillMaxSize()
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(beacons, key = { it.mac }) { b ->
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(b.name.ifBlank { "SprintBeacon" }, fontWeight = FontWeight.SemiBold)
+                                    Text("${b.mac}   RSSI ${b.rssi} dBm", style = MaterialTheme.typography.bodySmall)
+                                }
+                                Button(onClick = { onConnect(b.mac, b.name) }) { Text("Connect") }
+                            }
+                            Divider()
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     private fun MainScreenHost(
         db: AppDb,
         onNavigateHistory: () -> Unit,
-        onScan: () -> Unit,
-        onConnect: () -> Unit,
-        onArm: () -> Unit, // ← added
+        onArm: () -> Unit,
         connected: Boolean,
-        scanning: Boolean,
-        found: Boolean,
-        foundName: String?,
         lidarCm: Int?,
         liveTimerMs: Long,
         finalDeviceSprintMs: Long?,
         frozenMph: Double?,
         rangeLocked: Boolean,
+
+        // NEW (hoisted/saved)
+        selectedUser: String?,
         onSelectedUserChanged: (String?) -> Unit,
-        provideCalcRangeYards: () -> Double?
-    ) {
+        manualRangeText: String,
+        onManualRangeTextChanged: (String) -> Unit,
+        useLidar: Boolean,
+        onUseLidarChanged: (Boolean) -> Unit,
+        provideCalcRangeYards: () -> Double?,
+        connectedName: String?
+    )
+    {
         val context = LocalContext.current
 
         // Users stream
@@ -289,8 +396,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Selection + add-user UI state
-        var selectedUser by remember { mutableStateOf<String?>("Unassigned") }
+// Selection + add-user UI state (selectedUser now comes from parameters)
         var addingUser by remember { mutableStateOf(false) }
         var newUserText by remember { mutableStateOf("") }
 
@@ -300,23 +406,23 @@ class MainActivity : ComponentActivity() {
         // Convert LiDAR cm → yards
         val lidarYards = remember(lidarCm) { lidarCm?.let { it / 91.44 } }
 
-        // Range controls (textbox is truth when not using LiDAR)
-        var useLidar by remember { mutableStateOf(true) }
-        var calcText by remember { mutableStateOf("") }
-        var calcYards by remember { mutableStateOf<Double?>(null) }
+// Range controls — hoisted to root; textbox truth when not using LiDAR
+        val useLidarState = useLidar
+        val calcText = manualRangeText
+        var calcYards by remember { mutableStateOf<Double?>(manualRangeText.toDoubleOrNull()) }
 
         // Keep textbox mirrored to LiDAR while unlocked & using LiDAR
-        LaunchedEffect(lidarYards, useLidar, rangeLocked) {
-            if (!rangeLocked && useLidar) {
+        LaunchedEffect(lidarYards, useLidarState, rangeLocked) {
+            if (!rangeLocked && useLidarState) {
                 calcYards = lidarYards
-                calcText = lidarYards?.let { String.format("%.2f", it) } ?: ""
+                onManualRangeTextChanged(lidarYards?.let { String.format("%.2f", it) } ?: "")
             }
         }
 
         // Expose current calc range for START locking
-        LaunchedEffect(useLidar, calcYards, lidarYards, rangeLocked) {
+        LaunchedEffect(useLidarState, calcYards, lidarYards, rangeLocked) {
             currentCalcRangeYardsProvider = {
-                if (useLidar) (lidarYards ?: calcYards) else calcYards
+                if (useLidarState) (lidarYards ?: calcYards) else calcYards
             }
         }
 
@@ -326,7 +432,7 @@ class MainActivity : ComponentActivity() {
         ) {
             // Top bar
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Sprint Beacon", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                Text(connectedName ?: "Disconnected", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
                 TextButton(onClick = onNavigateHistory) { Text("History") }
             }
 
@@ -352,7 +458,7 @@ class MainActivity : ComponentActivity() {
                                         lifecycleScope.launch(Dispatchers.IO) {
                                             db.userDao().insert(UserEntity(name))
                                         }
-                                        selectedUser = name
+                                        onSelectedUserChanged(name)
                                         newUserText = ""
                                         addingUser = false
                                     } else {
@@ -389,7 +495,7 @@ class MainActivity : ComponentActivity() {
                                         DropdownMenuItem(
                                             text = { Text(u.name) },
                                             onClick = {
-                                                selectedUser = u.name
+                                                onSelectedUserChanged(u.name)
                                                 expanded = false
                                             }
                                         )
@@ -405,91 +511,98 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Scan / Connect / ARM
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = onScan,
-                    enabled = !_scanning.value && !_connected.value
-                ) { Text(if (scanning) "Scanning…" else "Scan") }
+            Card(Modifier.fillMaxWidth()) {
+                Column(
+                    Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    // Smaller title
+                    Text("Ranges (yd)", style = MaterialTheme.typography.titleSmall)
 
-                val connectLabel = when {
-                    connected -> "Connected"
-                    found && (foundName != null) -> "Connect to $foundName"
-                    found -> "Connect to device"
-                    else -> "Connect"
-                }
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = onConnect,
-                    enabled = !connected && found
-                ) { Text(connectLabel) }
-
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = onArm,
-                    enabled = connected
-                ) { Text("ARM / START") }
-            }
-
-            // Ranges block
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Ranges (yards)", style = MaterialTheme.typography.titleMedium)
-                    Text("LiDAR: ${lidarYards?.let { String.format("%.2f", it) } ?: "-"} yd")
-
+                    // One compact line: LiDAR value + checkbox
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Checkbox(
-                            checked = useLidar,
-                            onCheckedChange = { checked ->
-                                if (!rangeLocked) {
-                                    useLidar = checked
-                                    if (checked) {
-                                        calcYards = lidarYards
-                                        calcText = lidarYards?.let { String.format("%.2f", it) } ?: ""
-                                    }
-                                }
-                            },
-                            enabled = !rangeLocked
+                        Text(
+                            "LiDAR: ${lidarYards?.let { String.format("%.2f", it) } ?: "-"}",
+                            style = MaterialTheme.typography.bodySmall
                         )
-                        Text("Use LiDAR for calculations")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = useLidarState,
+                                onCheckedChange = { checked ->
+                                    if (!rangeLocked) {
+                                        onUseLidarChanged(checked)
+                                        if (checked) {
+                                            calcYards = lidarYards
+                                            onManualRangeTextChanged(lidarYards?.let { String.format("%.2f", it) } ?: "")
+                                        }
+                                    }
+                                },
+                                enabled = !rangeLocked
+                            )
+                            Text("Use LiDAR", style = MaterialTheme.typography.bodySmall)
+                        }
                     }
 
+                    // Manual textbox—single line, small label, tight height
                     OutlinedTextField(
                         value = calcText,
                         onValueChange = { txt ->
-                            if (!rangeLocked && !useLidar) {
+                            if (!rangeLocked && !useLidarState) {
                                 val clean = txt.filter { it.isDigit() || it == '.' }
-                                calcText = clean
+                                onManualRangeTextChanged(clean)
                                 calcYards = clean.toDoubleOrNull()
                             }
                         },
-                        modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Calc range (yards)") },
-                        enabled = !useLidar && !rangeLocked,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+                        label = { Text("Calc range (yd)", style = MaterialTheme.typography.bodySmall) },
+                        enabled = !useLidarState && !rangeLocked,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         singleLine = true
                     )
                 }
             }
 
-            // Big timer — LIVE ONLY
-            Box(
+
+// Big timer + Arm in one row (timer auto-fits)
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f),
-                contentAlignment = Alignment.Center
+                    .weight(1f),                 // this row grows to fill the available vertical space
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                val timeText = String.format("%.3f", liveTimerMs / 1000.0)
-                Text(text = timeText, fontSize = 64.sp, fontWeight = FontWeight.SemiBold)
+                // Timer gets most of the width and is centered in its area
+                Box(
+                    modifier = Modifier
+                        .weight(1f),             // take all remaining width
+                    contentAlignment = Alignment.Center
+                ) {
+                    BigTimer(
+                        millis = liveTimerMs,
+                        modifier = Modifier.fillMaxWidth(),
+                        maxSize = 320.sp,         // whatever max/min you prefer
+                        minSize = 32.sp
+                    )
+                }
+
+                Spacer(Modifier.width(16.dp))
+
+                // Button sits to the right, vertically centered by the Row’s verticalAlignment
+                Button(
+                    onClick = onArm,
+                    enabled = connected,
+                    modifier = Modifier
+                        .widthIn(min = 140.dp)
+                        .heightIn(min = 72.dp)
+                ) {
+                    Text("Arm", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                }
             }
+
+
 
             // Results — ONLY final device time & frozen MPH (after finish)
             Card(modifier = Modifier.fillMaxWidth()) {
@@ -502,7 +615,7 @@ class MainActivity : ComponentActivity() {
         }
 
         // Supply current calc range provider up to activity
-        currentCalcRangeYardsProvider = { if (useLidar) (lidarYards ?: calcYards) else calcYards }
+        currentCalcRangeYardsProvider = { if (useLidarState) (lidarYards ?: calcYards) else calcYards }
     }
 
     @OptIn(ExperimentalMaterial3Api::class)
@@ -671,8 +784,86 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+
+    @SuppressLint("UnusedBoxWithConstraintsScope")
+    @Composable
+    private fun AutoFitText(
+        text: String,
+        modifier: Modifier = Modifier,
+        maxSize: TextUnit = 220.sp,   // upper bound it can grow to
+        minSize: TextUnit = 24.sp,    // lower bound
+        weight: FontWeight? = FontWeight.SemiBold
+    ) {
+        val measurer = rememberTextMeasurer()
+
+        BoxWithConstraints(modifier) {
+            // convert available size from Dp -> px
+            val density = LocalDensity.current
+            val maxWpx = with(density) { maxWidth.toPx() }
+            val maxHpx = with(density) { maxHeight.toPx() }
+
+            if (maxWpx <= 0f || maxHpx <= 0f) return@BoxWithConstraints
+
+            // binary search for largest size that fits width & height
+            val fitted = remember(text, maxWpx, maxHpx) {
+                var lo = minSize.value
+                var hi = maxSize.value
+                var best = lo
+
+                val base = TextStyle(
+                    fontWeight = weight,
+                    platformStyle = PlatformTextStyle(includeFontPadding = false),
+                    // tabular numbers -> stable digit widths
+                    fontFeatureSettings = "tnum"
+                )
+
+                repeat(18) { // precision
+                    val mid = (lo + hi) / 2f
+                    val res = measurer.measure(
+                        text = text,
+                        style = base.copy(fontSize = mid.sp),
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                    val fits = res.size.width <= maxWpx && res.size.height <= maxHpx
+                    if (fits) { best = mid; lo = mid } else { hi = mid }
+                }
+                best.sp
+            }
+
+            Text(
+                text = text,
+                style = TextStyle(
+                    fontSize = fitted,
+                    fontWeight = weight,
+                    platformStyle = PlatformTextStyle(includeFontPadding = false),
+                    fontFeatureSettings = "tnum"
+                ),
+                maxLines = 1,
+                softWrap = false
+            )
+        }
+    }
+    @Composable
+    private fun BigTimer(
+        millis: Long,
+        modifier: Modifier = Modifier,
+        maxSize: TextUnit = 120.sp,   // starting/upper bound
+        minSize: TextUnit = 42.sp     // smallest allowed
+    ) {
+        // (No need to remember here; formatting is cheap and AutoFitText remembers layout)
+        val text = String.format(Locale.US, "%.3f", millis / 1000.0)
+        AutoFitText(
+            text = text,
+            modifier = modifier,
+            maxSize = maxSize,         // <-- was targetSize
+            minSize = minSize,
+            weight = FontWeight.SemiBold
+        )
+    }
     // ================= Scan → find device (unchanged) =================
     private fun onScanClicked() {
+        beacons.clear()
         _found.value = false
         lastFoundMac = null
         lastFoundName = null
@@ -713,29 +904,44 @@ class MainActivity : ComponentActivity() {
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            lastFoundMac = result.device.address
-            lastFoundName = result.device.name ?: "SprintBeacon"
+            val mac = result.device.address
+            val name = result.device.name ?: "SprintBeacon"
+            val rssi = result.rssi
+
+            // de-dupe by MAC and update best/latest RSSI & name
+            val idx = beacons.indexOfFirst { it.mac == mac }
+            if (idx >= 0) {
+                beacons[idx] = beacons[idx].copy(name = name, rssi = rssi)
+            } else {
+                beacons.add(Beacon(mac, name, rssi))
+            }
+
             _found.value = true
-            stopScan()
+            // NOTE: we DO NOT stop scan immediately; we let the 10 s window finish
         }
+
         override fun onBatchScanResults(results: MutableList<ScanResult>) {
-            if (results.isNotEmpty()) onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, results.first())
+            results.forEach { onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, it) }
         }
+
         override fun onScanFailed(errorCode: Int) { stopScan() }
     }
 
-    // ================= Connect & discover (unchanged + control hookup) =================
-    private fun connectToLastFound() {
-        val mac = lastFoundMac ?: return
+    private fun connectTo(mac: String, name: String?) {
         if (!hasAllNeededPermissions()) { requestNeededPermissions(); return }
         stopScan()
+
+        lastFoundMac = mac
+        lastFoundName = name ?: "SprintBeacon"
+
         val device = bluetoothAdapter.getRemoteDevice(mac)
         gatt = device.connectGatt(this, false, gattCallback)
     }
 
+
     private fun disconnectGatt() {
         stopPolling()
-        gatt?.let { it.disconnect(); it.close() }
+        gatt?.let { it.close() }  // ✅ just close
         gatt = null
         _connected.value = false
         chStatus = null; chRange = null; chSprint = null; chControl = null // ← clear control
@@ -747,13 +953,19 @@ class MainActivity : ComponentActivity() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 _connected.value = true
+                _connectedName.value = lastFoundName ?: "SprintBeacon"
+                _screen.value = Screen.Main      // ← go to main screen
                 gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                 gatt.requestMtu(247)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 _connected.value = false
+                _connectedName.value = null
                 stopPolling()
+                disconnectGatt()                 // ensures cleanup
+                _screen.value = Screen.Connect   // ← return to connect UI
             }
         }
+
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             gatt.discoverServices()
