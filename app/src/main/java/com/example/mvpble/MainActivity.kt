@@ -16,7 +16,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -26,10 +25,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -101,6 +96,9 @@ interface RunDao {
 
     @Insert
     suspend fun insert(run: RunEntity)
+
+    @Delete
+    suspend fun delete(run: RunEntity)
 }
 
 @Database(entities = [UserEntity::class, RunEntity::class], version = 1)
@@ -261,9 +259,11 @@ class MainActivity : ComponentActivity() {
                             scanning = _scanning.value,
                             beacons = beacons,
                             onScan = { onScanClicked() },
-                            onConnect = { mac, name -> connectTo(mac, name) }   // new function below
+                            onConnect = { mac, name -> connectTo(mac, name) },   // new function below
+                            onNavigateHistory = { _screen.value = Screen.History }
                         )
-                        Screen.Main -> MainScreenHost(
+                        Screen.Main -> if (_connected.value) {
+                            MainScreenHost(
                             db = db,
                             onNavigateHistory = { _screen.value = Screen.History },
                             connectedName = _connectedName.value,   // NEW
@@ -287,11 +287,22 @@ class MainActivity : ComponentActivity() {
 
                             provideCalcRangeYards = { currentCalcRangeYardsProvider?.invoke() }
                         )
-
+                        } else {
+                            // Guard: if somehow Main is requested while disconnected, kick to Connect.
+                            _screen.value = Screen.Connect
+                        }
                         Screen.History -> HistoryScreenHost(
                             db = db,
-                            onBack = { _screen.value = Screen.Main }
+                            isConnected = _connected.value,
+                            onBack = {
+                                if (_connected.value) {
+                                    _screen.value = Screen.Main     // connected → go back to Main
+                                } else {
+                                    _screen.value = Screen.Connect  // disconnected → go back to Connect
+                                }
+                            }
                         )
+
                     }
                 }
             }
@@ -308,7 +319,8 @@ class MainActivity : ComponentActivity() {
         scanning: Boolean,
         beacons: List<Beacon>,
         onScan: () -> Unit,
-        onConnect: (mac: String, name: String?) -> Unit
+        onConnect: (mac: String, name: String?) -> Unit,
+        onNavigateHistory: () -> Unit         // ← add
     ) {
         Column(
             Modifier
@@ -318,14 +330,12 @@ class MainActivity : ComponentActivity() {
         ) {
             Text("Bluetooth Connect", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
 
-            Button(
-                modifier = Modifier.fillMaxWidth(),
-                onClick = onScan,
-                enabled = !scanning
-            ) {
-                Text(if (scanning) "Scanning…" else "Scan")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = onNavigateHistory) { Text("History") }   // ← uses onHistory
+                Button(onClick = onScan, enabled = !scanning) {
+                    Text(if (scanning) "Scanning…" else "Scan")
+                }
             }
-
             Card(Modifier.fillMaxSize()) {
                 if (beacons.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -617,174 +627,6 @@ class MainActivity : ComponentActivity() {
         // Supply current calc range provider up to activity
         currentCalcRangeYardsProvider = { if (useLidarState) (lidarYards ?: calcYards) else calcYards }
     }
-
-    @OptIn(ExperimentalMaterial3Api::class)
-    @Composable
-    private fun HistoryScreenHost(
-        db: AppDb,
-        onBack: () -> Unit
-    ) {
-        val allUsers by produceState(initialValue = emptyList<UserEntity>()) {
-            db.userDao().observeAll().collectLatest { value = it }
-        }
-        var selected by remember { mutableStateOf<String?>("All") }
-
-        val runs: List<RunEntity> by produceState(initialValue = emptyList()) {
-            if (selected == null || selected == "All") {
-                db.runDao().observeAll().collectLatest { value = it }
-            } else {
-                db.runDao().observeForUser(selected!!).collectLatest { value = it }
-            }
-        }
-
-        Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = onBack) { Text("← Back") }
-                Text("History", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.width(48.dp))
-            }
-
-            // User filter
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                var expanded by remember { mutableStateOf(false) }
-                ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
-                    OutlinedTextField(
-                        value = selected ?: "All",
-                        onValueChange = {},
-                        readOnly = true,
-                        label = { Text("Filter user") },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
-                        modifier = Modifier.menuAnchor().fillMaxWidth()
-                    )
-                    ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                        DropdownMenuItem(text = { Text("All") }, onClick = { selected = "All"; expanded = false })
-                        allUsers.forEach { u ->
-                            DropdownMenuItem(text = { Text(u.name) }, onClick = { selected = u.name; expanded = false })
-                        }
-                    }
-                }
-            }
-
-            // Charts
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("Average MPH over time")
-                    LineChart(
-                        data = runs.map { it.timestamp to it.mph },
-                        yLabel = "MPH"
-                    )
-                }
-            }
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("MPH vs Range")
-                    ScatterChart(
-                        points = runs.map { it.rangeYards to it.mph },
-                        xLabel = "Range (yd)",
-                        yLabel = "MPH"
-                    )
-                }
-            }
-
-            // List
-            Card(Modifier.fillMaxSize()) {
-                val fmt = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
-                LazyColumn(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(runs) { r ->
-                        Column {
-                            Text("${fmt.format(Date(r.timestamp))} — ${r.userName}", fontWeight = FontWeight.SemiBold)
-                            Text("Sprint: ${String.format("%.3f s", r.sprintMs / 1000.0)}  |  Range: ${String.format("%.2f yd", r.rangeYards)}  |  MPH: ${String.format("%.2f", r.mph)}")
-                        }
-                        Divider(Modifier.padding(top = 8.dp))
-                    }
-                }
-            }
-        }
-    }
-
-    // ================= Simple charts (Canvas) =================
-
-    @Composable
-    private fun LineChart(
-        data: List<Pair<Long, Double>>,
-        yLabel: String,
-        modifier: Modifier = Modifier
-            .fillMaxWidth()
-            .height(180.dp)
-            .padding(6.dp)
-    ) {
-        if (data.isEmpty()) {
-            Box(modifier, contentAlignment = Alignment.Center) { Text("No data") }
-            return
-        }
-        val xs = data.map { it.first.toDouble() }
-        val ys = data.map { it.second }
-        val xMin = xs.minOrNull() ?: 0.0
-        val xMax = xs.maxOrNull() ?: 1.0
-        val yMin = min(ys.minOrNull() ?: 0.0, 0.0)
-        val yMax = max(ys.maxOrNull() ?: 1.0, 1.0)
-        Canvas(modifier) {
-            val pad = 32f
-            val w = size.width - pad * 2
-            val h = size.height - pad * 2
-            if (w <= 0 || h <= 0) return@Canvas
-
-            drawLine(Color.Gray, start = androidx.compose.ui.geometry.Offset(pad, size.height - pad),
-                end = androidx.compose.ui.geometry.Offset(size.width - pad, size.height - pad))
-            drawLine(Color.Gray, start = androidx.compose.ui.geometry.Offset(pad, pad),
-                end = androidx.compose.ui.geometry.Offset(pad, size.height - pad))
-
-            val path = Path()
-            data.sortedBy { it.first }.forEachIndexed { idx, (tx, yv) ->
-                val x = pad + ((tx - xMin) / (xMax - xMin).coerceAtLeast(1.0)) * w
-                val y = size.height - pad - ((yv - yMin) / (yMax - yMin).coerceAtLeast(1.0)) * h
-                if (idx == 0) path.moveTo(x.toFloat(), y.toFloat()) else path.lineTo(x.toFloat(), y.toFloat())
-            }
-            drawPath(path, Color(0xFF90CAF9), style = Stroke(width = 4f, cap = StrokeCap.Round))
-        }
-    }
-
-    @Composable
-    private fun ScatterChart(
-        points: List<Pair<Double, Double>>,
-        xLabel: String,
-        yLabel: String,
-        modifier: Modifier = Modifier
-            .fillMaxWidth()
-            .height(180.dp)
-            .padding(6.dp)
-    ) {
-        if (points.isEmpty()) {
-            Box(modifier, contentAlignment = Alignment.Center) { Text("No data") }
-            return
-        }
-        val xs = points.map { it.first }
-        val ys = points.map { it.second }
-        val xMin = xs.minOrNull() ?: 0.0
-        val xMax = xs.maxOrNull() ?: 1.0
-        val yMin = ys.minOrNull() ?: 0.0
-        val yMax = ys.maxOrNull() ?: 1.0
-
-        Canvas(modifier) {
-            val pad = 32f
-            val w = size.width - pad * 2
-            val h = size.height - pad * 2
-            if (w <= 0 || h <= 0) return@Canvas
-
-            drawLine(Color.Gray, start = androidx.compose.ui.geometry.Offset(pad, size.height - pad),
-                end = androidx.compose.ui.geometry.Offset(size.width - pad, size.height - pad))
-            drawLine(Color.Gray, start = androidx.compose.ui.geometry.Offset(pad, pad),
-                end = androidx.compose.ui.geometry.Offset(pad, size.height - pad))
-
-            points.forEach { (xv, yv) ->
-                val x = pad + ((xv - xMin) / (xMax - xMin).coerceAtLeast(1.0)) * w
-                val y = size.height - pad - ((yv - yMin) / (yMax - yMin).coerceAtLeast(1.0)) * h
-                drawCircle(Color(0xFFFFCC80), radius = 6f, center = androidx.compose.ui.geometry.Offset(x.toFloat(), y.toFloat()))
-            }
-        }
-    }
-
-
     @SuppressLint("UnusedBoxWithConstraintsScope")
     @Composable
     private fun AutoFitText(
